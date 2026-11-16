@@ -101,7 +101,7 @@ func (a API) compare(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, v)
 }
 func (a API) status(w http.ResponseWriter, r *http.Request) {
-	write(w, 200, observe.Summary(a.Service.Store.Read()))
+	write(w, 200, observe.Summary(a.Service.Store.Read(), a.Service.Store.Disk().Snapshot()))
 }
 func (a API) events(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, a.Service.Store.Read().Events)

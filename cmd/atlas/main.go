@@ -3,13 +3,16 @@ package main
 import (
 	"atlas-render/internal/engine"
 	"atlas-render/internal/httpapi"
+	"atlas-render/internal/model"
 	"atlas-render/internal/persist"
 	"atlas-render/internal/service"
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -20,6 +23,28 @@ func main() {
 		os.Exit(1)
 	}
 }
+func loadConfig() (persist.Config, error) {
+	cfg := persist.Config{
+		MarginBytes:  persist.DefaultMarginBytes,
+		MarginInodes: persist.DefaultMarginInodes,
+	}
+	if v := os.Getenv("ATLAS_DISK_MARGIN_BYTES"); v != "" {
+		n, e := strconv.ParseUint(v, 10, 64)
+		if e != nil {
+			return cfg, errors.New("ATLAS_DISK_MARGIN_BYTES must be a non-negative integer")
+		}
+		cfg.MarginBytes = n
+	}
+	if v := os.Getenv("ATLAS_DISK_MARGIN_INODES"); v != "" {
+		n, e := strconv.ParseUint(v, 10, 64)
+		if e != nil {
+			return cfg, errors.New("ATLAS_DISK_MARGIN_INODES must be a non-negative integer")
+		}
+		cfg.MarginInodes = n
+	}
+	cfg.FaultFull = os.Getenv("ATLAS_FAULT_FULL") == "1" || os.Getenv("ATLAS_FAULT_FULL") == "true"
+	return cfg, nil
+}
 func run() error {
 	addr := os.Getenv("ATLAS_ADDR")
 	if addr == "" {
@@ -29,14 +54,26 @@ func run() error {
 	if path == "" {
 		path = "var/atlas-state.json"
 	}
-	st, e := persist.Open(path)
+	cfg, e := loadConfig()
+	if e != nil {
+		return e
+	}
+	st, e := persist.Open(path, cfg)
 	if e != nil {
 		return e
 	}
 	defer st.Close()
 	worker := engine.New(st)
 	if e = worker.Recover(); e != nil {
-		return e
+		// A full state volume must not crash the process: keep serving reads
+		// and diagnostics in degraded mode until space is restored. A corrupt
+		// or invalid state is still fatal and never overwritten.
+		var de *model.Error
+		if errors.As(e, &de) && de.Code == "disk_full" {
+			log.Printf("startup recovery deferred: %v", e)
+		} else {
+			return e
+		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

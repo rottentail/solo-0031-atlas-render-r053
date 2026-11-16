@@ -71,6 +71,14 @@
     {
       "workflow_id": "observe-service",
       "command": "python3 scripts/walkthrough.py --workflow observe-service"
+    },
+    {
+      "workflow_id": "disk-protect",
+      "command": "python3 scripts/walkthrough.py --workflow disk-protect"
+    },
+    {
+      "workflow_id": "startup-safety",
+      "command": "python3 scripts/walkthrough.py --workflow startup-safety"
     }
   ],
   "environment": {

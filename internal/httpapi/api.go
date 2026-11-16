@@ -23,6 +23,10 @@ func write(w http.ResponseWriter, status int, v any) {
 func fail(w http.ResponseWriter, e error) {
 	var de *model.Error
 	if errors.As(e, &de) {
+		if de.Status == 503 {
+			// State volume pressure is transient; tell clients when to retry.
+			w.Header().Set("Retry-After", "30")
+		}
 		write(w, de.Status, map[string]string{"code": de.Code, "error": de.Message})
 		return
 	}
@@ -42,7 +46,14 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) error {
 }
 func (a API) Handler() http.Handler {
 	m := http.NewServeMux()
-	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ready"}) })
+	m.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		disk := a.Service.Store.Disk().Snapshot()
+		if !disk.Writable {
+			write(w, 503, map[string]any{"status": "degraded", "disk": disk})
+			return
+		}
+		write(w, 200, map[string]any{"status": "ready", "disk": disk})
+	})
 	m.HandleFunc("PUT /v1/scenes/{id}", a.putScene)
 	m.HandleFunc("GET /v1/scenes/{id}", a.getScene)
 	m.HandleFunc("POST /v1/scenes/{id}/state", a.sceneState)

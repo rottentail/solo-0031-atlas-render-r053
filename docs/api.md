@@ -21,10 +21,12 @@
 | GET /artifacts/{id} | 可选If-None-Match | PNG，200或304 |
 | DELETE /artifacts/{id} | 无 | state，200 |
 | POST /compare | left, right（结果ID） | 像素比较，200 |
-| GET /status | 无 | 场景/素材/快照/任务计数和结果字节数 |
+| GET /status | 无 | 场景/素材/快照/任务计数、结果字节数和 `disk` 卷状态 |
 | GET /events | 无 | 最多500个有序领域事件 |
 
-`GET /healthz` 不带 `/v1`，返回ready。它表明进程已打开并恢复状态，不包含单独的磁盘可写探测。任务响应省略固定输入的有效载荷，输入细节通过快照接口读取。
+所有需要持久提交的入口在状态盘空间不足时返回 **503**，JSON 形如 `{"code":"disk_full","error":"..."}` 并带 `Retry-After: 30` 响应头。503 表示事务在任何业务变更之前被拒绝，没有任何承诺落盘；客户端应保持原幂等键稍后重试。只读入口（GET、结果下载、`/v1/compare`）不受影响。`DELETE /artifacts/{id}` 是例外：它只缩小状态，满盘时仍可提交，用于释放空间。`disk` 块字段为 `writable`、`reason`、`faultInjected`、`path`、`freeBytes`、`totalBytes`、`freeInodes`、`marginBytes`、`marginInodes`、`checkedAt`。
+
+`GET /healthz` 不带 `/v1`，可写时返回200并附 `disk` 状态；状态盘低于预留水位时返回503，响应体 `status` 为 `degraded` 且包含同样的 `disk` 详情。它表明进程已打开并恢复状态，磁盘探测直接 `statfs` 状态目录，不做试探性写入。任务响应省略固定输入的有效载荷，输入细节通过快照接口读取。
 
 文档字段：width、height、background、layers。每个图层有id、kind、width、height、transform、opacity、fill；transform包括x、y、scaleX、scaleY、degrees。图层可以有clip（x/y/width/height），group使用children，polygon使用points，image使用assetId。solid颜料有color；linear还包括endColor、from、to。示例是可直接提交的完整请求。
 

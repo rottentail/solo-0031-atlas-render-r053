@@ -104,7 +104,9 @@ func (s *Service) Retry(id string) (model.Job, error) {
 	return out, e
 }
 func (s *Service) Purge(id string) error {
-	return s.Store.Update(func(st *model.State) error {
+	// Purge only removes PNG bytes, so it stays available while the state
+	// volume is full and gives operators a self-service recovery lever.
+	return s.Store.UpdateRelief(func(st *model.State) error {
 		a, ok := st.Artifacts[id]
 		if !ok {
 			return model.Missing("artifact not found")

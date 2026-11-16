@@ -40,9 +40,10 @@ def tiny_png():
 
 
 class Demo:
-    def __init__(self, binary, directory):
+    def __init__(self, binary, directory, fault_full=False):
         self.binary = binary
         self.directory = directory
+        self.fault_full = fault_full
         self.proc = None
         self.log = open(directory / 'server.log', 'ab')
         self.start()
@@ -53,15 +54,28 @@ class Demo:
             port = sock.getsockname()[1]
         self.url = f'http://127.0.0.1:{port}'
         env = dict(os.environ, ATLAS_ADDR=f'127.0.0.1:{port}', ATLAS_STATE=str(self.directory / 'state.json'))
+        # Some container overlay filesystems report zero free inodes; the
+        # exercise controls failures through ATLAS_FAULT_FULL and byte margins.
+        env['ATLAS_DISK_MARGIN_INODES'] = '0'
+        if self.fault_full:
+            env['ATLAS_FAULT_FULL'] = '1'
         self.proc = subprocess.Popen([str(self.binary)], env=env, stdout=self.log, stderr=self.log)
         for _ in range(100):
             try:
-                self.call('GET', '/healthz')
-                return
+                with urllib.request.urlopen(urllib.request.Request(self.url + '/healthz'), timeout=5) as r:
+                    r.read()
+                    got = r.status
+            except urllib.error.HTTPError as error:
+                got = error.status
             except (urllib.error.URLError, ConnectionError):
                 if self.proc.poll() is not None:
                     raise RuntimeError((self.directory / 'server.log').read_text())
                 time.sleep(.03)
+                continue
+            # In fault mode the first response is the degraded 503; otherwise 200.
+            if got == (503 if self.fault_full else 200):
+                return
+            time.sleep(.03)
         raise RuntimeError('server startup deadline exceeded')
 
     def stop(self, abrupt=False):
@@ -86,6 +100,24 @@ class Demo:
             if response.headers.get('Content-Type', '').startswith('application/json'):
                 return json.loads(data)
             return data
+
+    def expect_disk_full(self, method, path, body=None, headers=None):
+        """Assert a mutation is rejected with the disk_full 503 contract."""
+        hdr = dict(headers or {})
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode()
+            hdr['Content-Type'] = 'application/json'
+        request = urllib.request.Request(self.url + path, data=body, method=method, headers=hdr)
+        try:
+            response = urllib.request.urlopen(request, timeout=15)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            payload = json.loads(response.read())
+            assert response.status == 503, f'{method} {path}: expected 503, got {response.status}'
+            assert response.headers.get('Retry-After') == '30'
+            assert payload['code'] == 'disk_full', payload
+            return payload
 
     def wait(self, job_id, wanted=('succeeded',)):
         deadline = time.monotonic() + 20
@@ -186,6 +218,196 @@ def run(demo, workflow, out):
     return {'workflow': workflow, 'state': result['state'], 'pngBytes': len(png), 'pngDigest': hashlib.sha256(png).hexdigest()}
 
 
+def disk_protect(binary, directory):
+    """Controlled disk-full exercise using the ATLAS_FAULT_FULL guard seam."""
+    state_dir = directory / 'diskcase'
+    state_dir.mkdir()
+    healthy = Demo(binary, state_dir)
+    try:
+        scene_doc = sample()
+        snapshot = healthy.call('POST', '/v1/scenes/emblem/snapshots',
+                                {'expectedRevision': healthy.call(
+                                    'PUT', '/v1/scenes/emblem',
+                                    {'name': '磁盘演练', 'expectedRevision': 0, 'document': scene_doc})['revision']}, 201)
+        # A committed job and its result prove reads survive the outage.
+        done = healthy.wait(healthy.submit(snapshot, 'before-outage')['id'])
+        artifact = done['artifactId']
+        png = healthy.call('GET', '/v1/artifacts/' + artifact)
+        assert png[:8] == b'\x89PNG\r\n\x1a\n'
+        # Queue one more job; it stays parked while the disk is unavailable.
+        parked = healthy.submit(snapshot, 'parked-job')
+        healthy.wait(parked['id'], wanted=('queued', 'running', 'succeeded'))
+    finally:
+        healthy.stop()
+
+    # Restart with the same state directory and the disk guard forced full.
+    faulty = Demo(binary, state_dir, fault_full=True)
+    try:
+        health = faulty.call('GET', '/healthz', status=503)
+        assert health['status'] == 'degraded' and health['disk']['writable'] is False
+        assert health['disk']['faultInjected'] is True and health['disk']['reason']
+        status = faulty.call('GET', '/v1/status')
+        assert status['disk']['writable'] is False
+
+        # No new durable promises while full: every mutation is rejected up front.
+        faulty.expect_disk_full('POST', '/v1/jobs',
+                                {'snapshotId': snapshot['id'], 'scale': 1},
+                                {'Idempotency-Key': 'blocked-by-disk'})
+        faulty.expect_disk_full('PUT', '/v1/scenes/other',
+                                {'name': '不应存在', 'expectedRevision': 0, 'document': sample()})
+        faulty.expect_disk_full('POST', '/v1/snapshots/' + snapshot['id'] + '/revoke')
+        # The rejected receipt never landed: after recovery the key must work.
+        assert faulty.call('GET', '/v1/jobs/' + parked['id'])['id'] == parked['id']
+
+        # Reads, downloads and diagnostics stay available.
+        again = faulty.call('GET', '/v1/artifacts/' + artifact)
+        assert again == png
+        faulty.call('GET', '/v1/jobs/' + done['id'])
+        faulty.call('GET', '/v1/events')
+        faulty.call('POST', '/v1/compare',
+                    {'left': artifact, 'right': artifact})
+
+        # Purge is the relief path: it shrinks state and must commit while full.
+        relief_dir = directory / 'relief'
+        relief_dir.mkdir(exist_ok=True)
+        relief = Demo(binary, relief_dir)
+        try:
+            relief_snap = relief.call('POST', '/v1/scenes/r/snapshots', {
+                'expectedRevision': relief.call('PUT', '/v1/scenes/r', {
+                    'name': '救济', 'expectedRevision': 0, 'document': sample()})['revision']}, 201)
+            relief_job = relief.wait(relief.submit(relief_snap, 'relief-job')['id'])
+            relief_artifact = relief_job['artifactId']
+        finally:
+            relief.stop()
+        relief = Demo(binary, relief_dir, fault_full=True)
+        try:
+            relief.call('DELETE', '/v1/artifacts/' + relief_artifact)
+            relief.call('GET', '/v1/artifacts/' + relief_artifact, status=410)
+            assert relief.call('GET', '/v1/jobs/' + relief_job['id'])['state'] == 'succeeded'
+        finally:
+            relief.stop()
+    finally:
+        faulty.stop()
+
+    # Recovery: same process family, guard off, same state. No duplicate keys,
+    # no lost results, parked jobs drain automatically.
+    recovered = Demo(binary, state_dir)
+    try:
+        assert recovered.call('GET', '/healthz')['disk']['writable'] is True
+        # The key rejected during the outage now accepts exactly one job.
+        unblocked = recovered.wait(recovered.submit(snapshot, 'blocked-by-disk')['id'])
+        assert unblocked['state'] == 'succeeded'
+        # Replaying it returns the same job; no duplicate receipt or job.
+        replay = recovered.submit(snapshot, 'blocked-by-disk')
+        assert replay['id'] == unblocked['id']
+        # Pre-outage result bytes are intact and identical.
+        assert recovered.call('GET', '/v1/artifacts/' + artifact) == png
+        # The parked job drained as well.
+        assert recovered.wait(parked['id'])['state'] == 'succeeded'
+        jobs = recovered.call('GET', '/v1/status')['jobs']
+        assert jobs.get('failed', 0) == 0 and jobs.get('cancelled', 0) == 0
+    finally:
+        recovered.stop()
+
+    # Mid-render outage: a job caught in "running" must replay, never hang and
+    # never double-commit. The process is killed mid-render, then restarted
+    # straight into degraded (full) mode before a healthy restart.
+    crash_dir = directory / 'crashcase'
+    crash_dir.mkdir()
+    crash = Demo(binary, crash_dir)
+    try:
+        heavy = sample(); heavy['width'] = 1500; heavy['height'] = 1500
+        heavy['layers'] = [dict(heavy['layers'][0], id=f'sheet-{i}', width=1500, height=1500,
+                                transform={'scaleX': 1, 'scaleY': 1}) for i in range(16)]
+        snap = crash.call('POST', '/v1/scenes/emblem/snapshots', {
+            'expectedRevision': crash.call('PUT', '/v1/scenes/emblem', {
+                'name': '中断', 'expectedRevision': 0, 'document': heavy})['revision']}, 201)
+        victim = crash.submit(snap, 'crash-victim')
+        crash.wait(victim['id'], wanted=('running',))
+        crash.stop(abrupt=True)
+    finally:
+        if crash.proc and crash.proc.poll() is None:
+            crash.stop(abrupt=True)
+    degraded = Demo(binary, crash_dir, fault_full=True)
+    try:
+        # Startup recovery cannot commit while full: the job remains running
+        # and the process still serves read-only diagnostics.
+        assert degraded.call('GET', '/healthz', status=503)['disk']['writable'] is False
+        assert degraded.call('GET', '/v1/jobs/' + victim['id'])['state'] == 'running'
+    finally:
+        degraded.stop()
+    revived = Demo(binary, crash_dir)
+    try:
+        result = revived.wait(victim['id'])
+        assert result['state'] == 'succeeded' and result['attempt'] == 1
+        assert revived.call('GET', '/v1/artifacts/' + result['artifactId'])[:8] == b'\x89PNG\r\n\x1a\n'
+        kinds = {e['kind'] for e in revived.call('GET', '/v1/events')}
+        assert 'job.recovered' in kinds or 'job.requeued' in kinds
+        # Exactly one job and one result survived the whole sequence.
+        assert sum(revived.call('GET', '/v1/status')['jobs'].values()) == 1
+        assert revived.call('GET', '/v1/jobs/' + victim['id'])['artifactId'] == result['artifactId']
+    finally:
+        revived.stop()
+    return {'workflow': 'disk-protect', 'rejectedReceiptAcceptedOnce': True,
+            'resultBytesPreserved': len(png), 'parkedJobDrained': True,
+            'interruptedJobReplayed': True}
+
+
+def startup_safety(binary, directory):
+    """Corrupt/empty state must never be replaced by an empty database."""
+    case = directory / 'startupcase'
+    case.mkdir()
+    state_path = case / 'state.json'
+    port_holder = socket.socket()
+    port_holder.bind(('127.0.0.1', 0))
+    free_port = port_holder.getsockname()[1]
+    port_holder.close()
+
+    def attempt_start(payload):
+        if payload is not None:
+            state_path.write_bytes(payload)
+        log_path = case / 'fail.log'
+        env = dict(os.environ, ATLAS_ADDR=f'127.0.0.1:{free_port}', ATLAS_STATE=str(state_path),
+                   ATLAS_DISK_MARGIN_INODES='0')
+        with open(log_path, 'ab') as log:
+            proc = subprocess.Popen([str(binary)], env=env, stdout=log, stderr=log)
+            try:
+                rc = proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                raise AssertionError('process should have exited on bad state')
+        return rc, log_path.read_text()
+
+    # Empty file: refused, file preserved, no empty-store overwrite.
+    rc, output = attempt_start(b'')
+    assert rc != 0 and 'empty' in output, output
+    assert state_path.read_bytes() == b''
+    # Truncated JSON: refused with an explicit parse error.
+    bad = b'{"version":1,"scenes":{'
+    rc, output = attempt_start(bad)
+    assert rc != 0 and 'invalid persisted JSON' in output, output
+    assert state_path.read_bytes() == bad
+    # A valid state still opens in a fresh directory, and stale temp files are
+    # swept on open. The corrupt file above is deliberately left in place.
+    good = case / 'good'
+    good.mkdir()
+    seed = Demo(binary, good)
+    try:
+        seed.call('PUT', '/v1/scenes/keep',
+                  {'name': '保留', 'expectedRevision': 0, 'document': sample()})
+    finally:
+        seed.stop()
+    (good / '.atlas-write-stale').write_bytes(b'leftover')
+    reopened = Demo(binary, good)
+    try:
+        assert reopened.call('GET', '/v1/scenes/keep')['revision'] == 1
+        assert not (good / '.atlas-write-stale').exists()
+    finally:
+        reopened.stop()
+    return {'workflow': 'startup-safety', 'emptyStateRejected': True,
+            'corruptStateRejected': True, 'staleTempSwept': True}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--workflow', default='submit-render')
@@ -194,6 +416,12 @@ def main():
     with tempfile.TemporaryDirectory(prefix='atlas-walkthrough-') as temp:
         directory = Path(temp); binary = directory / 'atlas'
         subprocess.run(['go', 'build', '-o', str(binary), './cmd/atlas'], cwd=ROOT, check=True, timeout=60)
+        if args.workflow == 'disk-protect':
+            print(json.dumps(disk_protect(binary, directory), ensure_ascii=False))
+            return
+        if args.workflow == 'startup-safety':
+            print(json.dumps(startup_safety(binary, directory), ensure_ascii=False))
+            return
         demo = Demo(binary, directory)
         try:
             print(json.dumps(run(demo, args.workflow, args.out), ensure_ascii=False))

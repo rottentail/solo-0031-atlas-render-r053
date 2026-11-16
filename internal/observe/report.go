@@ -53,7 +53,7 @@ func Compare(a, b model.Artifact) (Comparison, error) {
 	out.MeanDelta = float64(total) / float64(out.Width*out.Height*4)
 	return out, nil
 }
-func Summary(st model.State) map[string]any {
+func Summary(st model.State, disk any) map[string]any {
 	jobs := map[string]int{}
 	for _, j := range st.Jobs {
 		jobs[j.State]++
@@ -62,5 +62,5 @@ func Summary(st model.State) map[string]any {
 	for _, a := range st.Artifacts {
 		bytes += len(a.PNG)
 	}
-	return map[string]any{"sceneCount": len(st.Scenes), "assetCount": len(st.Assets), "snapshotCount": len(st.Snapshots), "jobs": jobs, "artifactBytes": bytes, "sequence": st.Sequence}
+	return map[string]any{"sceneCount": len(st.Scenes), "assetCount": len(st.Assets), "snapshotCount": len(st.Snapshots), "jobs": jobs, "artifactBytes": bytes, "sequence": st.Sequence, "disk": disk}
 }

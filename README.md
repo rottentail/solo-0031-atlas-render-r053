@@ -44,4 +44,6 @@ python3 scripts/walkthrough.py --workflow compare-renders
 
 持久化使用完整 JSON 状态的原子替换，保留全部任务与快照，事件只保留最近 500 条。适合中小规模、单写实例工作负载。清理结果只释放 PNG 字节，仍保留任务事实和摘要。进程重启可恢复任务；突然断电的文件系统耐久性不作额外保证。
 
+状态盘空间由内置磁盘守卫保护：可用字节/inode 低于预留水位（`ATLAS_DISK_MARGIN_BYTES` 默认 64 MiB、`ATLAS_DISK_MARGIN_INODES` 默认 128）时，所有需要落盘的入口返回 503 `disk_full` 且拒绝发生在业务变更之前，只读接口、结果下载和结果清理（救济通道）继续可用，执行器停止领取并在恢复后自动把滞留任务重新入队。`/healthz` 与 `/v1/status` 暴露磁盘详情；空文件或损坏状态会拒绝启动而不是覆盖成空库。详见 `docs/operations.md`。
+
 测试处于 deferred 阶段，基线未包含自动化测试套件或 `test_command`。生产工作流检查、构建与静态检查已单独提供。接口和持久状态的规则详见 `PROJECT_SPEC.md`、`docs/api.md`、`docs/operations.md`。

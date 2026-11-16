@@ -350,6 +350,39 @@
         "通过存储或渲染结果观察已提交事实"
       ],
       "verification": "python3 scripts/walkthrough.py --workflow observe-service"
+    },
+    {
+      "id": "disk-protect",
+      "name": "状态盘空间故障保护",
+      "entry": "POST /v1/jobs (disk full)",
+      "success": "满盘时落盘入口返回503 disk_full且不产生收据，只读与下载保持可用，恢复后旧键唯一入队、结果不丢、滞留任务自动重放",
+      "failure": "空间不足时仍接受任务或覆盖既有状态",
+      "module_ids": [
+        "persist",
+        "service",
+        "engine",
+        "httpapi"
+      ],
+      "steps": [
+        "健康实例提交任务并产出结果后以ATLAS_FAULT_FULL重启",
+        "验证503+Retry-After、只读可用、purge救济通道、恢复后幂等与孤儿running重放"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow disk-protect"
+    },
+    {
+      "id": "startup-safety",
+      "name": "损坏与空状态启动保护",
+      "entry": "process startup",
+      "success": "空文件和损坏JSON拒绝启动且原文件保留，合法状态可打开并清理遗留临时文件",
+      "failure": "损坏状态被空库覆盖",
+      "module_ids": [
+        "persist"
+      ],
+      "steps": [
+        "分别写入空文件和截断JSON启动，断言非零退出且文件未被改写",
+        "合法状态启动并验证.atlas-write-*临时文件清理"
+      ],
+      "verification": "python3 scripts/walkthrough.py --workflow startup-safety"
     }
   ],
   "complexity": {

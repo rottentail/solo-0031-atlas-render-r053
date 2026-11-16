@@ -1,6 +1,10 @@
 [Unit]
 Description=Atlas Render static composition service
 After=network.target
+# Start failure on a corrupt/empty state file is a hard error: do not restart
+# in a tight loop, surface it to the operator instead.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -8,13 +12,23 @@ User=atlas
 WorkingDirectory=/opt/atlas
 Environment=ATLAS_ADDR=127.0.0.1:8763
 Environment=ATLAS_STATE=/var/lib/atlas/state.json
+# Refuse durable commits while the state volume has less than this much headroom.
+# Size the margins to the largest expected single state file write.
+Environment=ATLAS_DISK_MARGIN_BYTES=67108864
+Environment=ATLAS_DISK_MARGIN_INODES=128
 ExecStart=/opt/atlas/atlas
+# On-failure restart only: a disk-full condition degrades inside the process
+# (read-only diagnostics stay up) rather than exiting, so no restart storm.
 Restart=on-failure
+RestartSec=5
 TimeoutStopSec=20
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ReadWritePaths=/var/lib/atlas
+# Keep the service attached to disk-pressure events; RequiresMountsFor ensures
+# the state volume is mounted before start and after remounts.
+RequiresMountsFor=/var/lib/atlas
 
 [Install]
 WantedBy=multi-user.target
